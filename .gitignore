@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Çalışma zamanı logları
+logs/
+
+# Editör / OS
+.DS_Store
+Thumbs.db
