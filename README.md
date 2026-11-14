@@ -1,50 +1,48 @@
 # Inventor LLM
 
-Claude (veya MCP destekleyen herhangi bir LLM istemcisi) ile **Autodesk Inventor 2027** arasında köprü kuran bir [MCP](https://modelcontextprotocol.io) sunucusu. Sunucu, çalışan Inventor oturumuna **Python + COM** (pywin32, dynamic dispatch) üzerinden bağlanır ve LLM'in:
+An [MCP](https://modelcontextprotocol.io) server that bridges Claude (or any MCP-capable LLM client) and **Autodesk Inventor 2027**. The server connects to a running Inventor session through **Python + COM** (pywin32, dynamic dispatch) and lets the LLM:
 
-- Inventor API dokümantasyonunda arama yapmasını,
-- Modeli okumasını (parametreler, feature ağacı, kütle, sınır kutusu, ekran görüntüsü),
-- Kendi yazdığı Python kodunu Inventor içinde **transaction güvencesiyle** çalıştırmasını
-
-sağlar.
+- Search the Inventor API documentation,
+- Read the model (parameters, feature tree, mass, bounding box, screenshots),
+- Run its own Python code inside Inventor, **wrapped in a transaction**.
 
 ---
 
-## İçindekiler
+## Contents
 
-- [Mimari](#mimari)
-- [Gereksinimler](#gereksinimler)
-- [Kurulum](#kurulum)
-- [Claude'a bağlama](#claudea-bağlama)
-- [Tool'lar](#toollar)
-- [execute ortamı](#execute-ortamı)
-- [Birimler](#birimler)
-- [Güvenlik ve geri alma](#güvenlik-ve-geri-alma)
-- [Dosya yapısı](#dosya-yapısı)
-- [Sorun giderme](#sorun-giderme)
+- [Architecture](#architecture)
+- [Requirements](#requirements)
+- [Installation](#installation)
+- [Connecting to Claude](#connecting-to-claude)
+- [Tools](#tools)
+- [The execute environment](#the-execute-environment)
+- [Units](#units)
+- [Safety and undo](#safety-and-undo)
+- [Project layout](#project-layout)
+- [Troubleshooting](#troubleshooting)
 
 ---
 
-## Mimari
+## Architecture
 
 ```mermaid
 flowchart LR
-    subgraph Client["LLM istemcisi"]
+    subgraph Client["LLM client"]
         C["Claude Desktop / Claude Code"]
     end
 
     subgraph Server["server.py (FastMCP, stdio)"]
         direction TB
-        L1["Katman 1 — Dokümantasyon<br/>api_guide · api_search · api_get · api_enum"]
-        L2["Katman 2 — execute<br/>LLM'in yazdığı Python kodu"]
-        L3["Katman 3 — Hazır tool'lar<br/>parametre · feature ağacı · ekran görüntüsü"]
-        Q[["İş kuyruğu (queue.Queue)"]]
-        W["COM işçi thread'i<br/>(tek thread, CoInitialize)"]
+        L1["Layer 1 — Documentation<br/>api_guide · api_search · api_get · api_enum"]
+        L2["Layer 2 — execute<br/>Python code written by the LLM"]
+        L3["Layer 3 — Built-in tools<br/>parameters · feature tree · screenshot"]
+        Q[["Job queue (queue.Queue)"]]
+        W["COM worker thread<br/>(single thread, CoInitialize)"]
         LOG[("logs/calls.jsonl")]
     end
 
     DB[("inventor_api.db<br/>SQLite + FTS5")]
-    INV["Autodesk Inventor 2027<br/>(çalışan oturum)"]
+    INV["Autodesk Inventor 2027<br/>(running session)"]
 
     C <-- "MCP (stdio / JSON-RPC)" --> Server
     L1 --> DB
@@ -56,51 +54,51 @@ flowchart LR
     L3 -.-> LOG
 ```
 
-**Temel tasarım kararları**
+**Key design decisions**
 
-| Karar | Neden |
+| Decision | Why |
 |---|---|
-| Tüm COM çağrıları **tek bir işçi thread'inde** | COM nesneleri apartment'a bağlıdır; MCP isteklerinin farklı thread'lerden gelmesi Inventor'ı kilitleyebilir. |
-| `dynamic.Dispatch` (early binding yok) | `makepy` önbelleğine gerek kalmaz, Inventor sürüm değişikliklerine dayanıklıdır. |
-| API dokümantasyonu yerel SQLite'ta | LLM'in metot adı uydurması yerine gerçek imzaya bakmasını sağlar; ağ erişimi gerekmez. |
-| `stdout` yalnızca MCP protokolüne ayrılmış | Sunucu kodunda `print()` kullanılmaz; `execute` içindeki `print` yakalanıp sonuca eklenir. |
+| All COM calls run on **a single worker thread** | COM objects are bound to their apartment; MCP requests arriving on different threads can hang Inventor. |
+| `dynamic.Dispatch` (no early binding) | No `makepy` cache needed, and more resilient to Inventor version changes. |
+| API documentation stored in local SQLite | The LLM looks up real signatures instead of inventing method names; no network access required. |
+| `stdout` is reserved for the MCP protocol | The server never calls `print()`; `print` inside `execute` is captured and returned in the result. |
 
-### İstek akışı
+### Request flow
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant LLM as Claude
     participant MCP as server.py (MCP thread)
-    participant Q as İş kuyruğu
-    participant W as COM işçi thread'i
+    participant Q as Job queue
+    participant W as COM worker thread
     participant INV as Inventor
 
-    LLM->>MCP: tool çağrısı (ör. set_parameter)
+    LLM->>MCP: tool call (e.g. set_parameter)
     MCP->>Q: job(fn) + Event
-    Q->>W: job al
-    W->>W: _get_app() — bağlantı canlı mı?
-    W->>INV: COM çağrıları
-    INV-->>W: sonuç / hata
-    W-->>MCP: box["ok"] veya box["err"], Event.set()
-    alt zaman aşımı (varsayılan 120 sn)
-        MCP-->>LLM: TimeoutError — "açık bir diyalog olabilir"
+    Q->>W: take job
+    W->>W: _get_app() — is the connection alive?
+    W->>INV: COM calls
+    INV-->>W: result / error
+    W-->>MCP: box["ok"] or box["err"], Event.set()
+    alt timeout (default 120 s)
+        MCP-->>LLM: TimeoutError — "a dialog may be open"
     else
         MCP->>MCP: log_call → logs/calls.jsonl
-        MCP-->>LLM: JSON sonuç
+        MCP-->>LLM: JSON result
     end
 ```
 
 ---
 
-## Gereksinimler
+## Requirements
 
 - Windows 10/11
-- Autodesk Inventor 2027 (sunucu çalışırken **açık** olmalı)
-- Python 3.10+ (proje conda ortamıyla geliştirildi)
-- Paketler: `pywin32`, `mcp`
+- Autodesk Inventor 2027 (must be **running** while the server is in use)
+- Python 3.10+ (developed in a conda environment)
+- Packages: `pywin32`, `mcp`
 
-## Kurulum
+## Installation
 
 ```powershell
 git clone <repo-url> InventorLLM
@@ -111,19 +109,19 @@ conda activate inventor
 pip install pywin32 "mcp[cli]"
 ```
 
-`inventor_api.db` (~55 MB) repoyla birlikte gelir. Sunucu veritabanını şu sırayla arar:
+`inventor_api.db` (~55 MB) ships with the repo. The server looks for the database in this order:
 
-1. `INVENTOR_API_DB` ortam değişkeni
-2. `server.py` ile aynı klasör
+1. The `INVENTOR_API_DB` environment variable
+2. The same folder as `server.py`
 3. `~/Desktop/Inventor/inventor_api.db`
 
-Hızlı test (Inventor açıkken):
+Quick test (with Inventor open):
 
 ```powershell
-mcp dev server.py     # MCP Inspector ile tool'ları elle dene
+mcp dev server.py     # try the tools by hand in the MCP Inspector
 ```
 
-## Claude'a bağlama
+## Connecting to Claude
 
 **Claude Code**
 
@@ -146,100 +144,100 @@ claude mcp add inventor -- C:\path\to\conda\envs\inventor\python.exe C:\path\to\
 
 ---
 
-## Tool'lar
+## Tools
 
 ```mermaid
 mindmap
   root((inventor MCP))
-    Dokümantasyon
+    Documentation
       api_guide
       api_search
       api_get
       api_enum
-    Kod çalıştırma
+    Code execution
       execute
-    Okuma
+    Read
       connect
       list_documents
       get_active_document
       get_parameters
       get_feature_tree
       capture_view
-    Değiştirme
+    Modify
       set_parameter
       undo_last
 ```
 
-### Katman 1 — Dokümantasyon
+### Layer 1 — Documentation
 
-| Tool | Açıklama |
+| Tool | Description |
 |---|---|
-| `api_guide()` | Bu sunucuda Inventor API'yi Python ile kullanma rehberi. LLM ilk kullanımda okur. |
-| `api_search(query, kind="", limit=12)` | Reference Manual, User's Manual ve örneklerde FTS5 (bm25) araması. `kind`: `object`, `method`, `property`, `event`, `enum`, `sample`, `manual`. |
-| `api_get(name, max_chars=12000)` | Bir sayfanın tamamı (`ExtrudeFeatures`, `ExtrudeFeatures.Add`, ...). Metot/özelliklerde tip kütüphanesinden kesin imza eklenir. |
-| `api_enum(query)` | Enum adı, sabit adı veya sayısal değere göre arama (`kJoin`, `20481`). |
+| `api_guide()` | Guide to using the Inventor API from Python on this server. The LLM reads it on first use. |
+| `api_search(query, kind="", limit=12)` | FTS5 (bm25) search across the Reference Manual, User's Manual and samples. `kind`: `object`, `method`, `property`, `event`, `enum`, `sample`, `manual`. |
+| `api_get(name, max_chars=12000)` | Full page (`ExtrudeFeatures`, `ExtrudeFeatures.Add`, ...). For methods/properties, the exact signature from the type library is included. |
+| `api_enum(query)` | Look up enums by enum name, constant name or numeric value (`kJoin`, `20481`). |
 
-### Katman 2 — Kod çalıştırma
+### Layer 2 — Code execution
 
-| Tool | Açıklama |
+| Tool | Description |
 |---|---|
-| `execute(code, description, transaction=True, timeout_s=180)` | LLM'in yazdığı Python kodunu Inventor'da çalıştırır. Sonuç `result = ...` ile döndürülür; `print` çıktısı `output` alanına gelir. |
+| `execute(code, description, transaction=True, timeout_s=180)` | Runs LLM-written Python code inside Inventor. Return a value with `result = ...`; `print` output comes back in the `output` field. |
 
-### Katman 3 — Hazır tool'lar
+### Layer 3 — Built-in tools
 
-| Tool | Açıklama |
+| Tool | Description |
 |---|---|
-| `connect()` | Inventor sürümü, açık doküman sayısı, aktif doküman. |
-| `list_documents()` | Açık dokümanlar (ad, yol, tip, kaydedilmemiş değişiklik). |
-| `get_active_document()` | Aktif doküman + kütle (kg), hacim (mm³), sınır kutusu (mm). |
-| `get_parameters(name_filter="")` | Parametreler (mm / deg / ul), ifade, `user`/`model` türü ve sahibi (feature veya sketch). |
-| `get_feature_tree()` | Feature ağacı: sıra, ad, tip, bastırılmış mı. |
-| `capture_view(width, height, fit)` | Aktif görünümün PNG ekran görüntüsü. |
-| `set_parameter(name, value, unit="mm")` | Parametreyi değiştirir, modeli günceller; öncesi/sonrası kütle ve bbox döner. |
-| `undo_last()` | Inventor'daki son işlemi geri alır. |
+| `connect()` | Inventor version, number of open documents, active document. |
+| `list_documents()` | Open documents (name, path, type, unsaved changes). |
+| `get_active_document()` | Active document plus mass (kg), volume (mm³), bounding box (mm). |
+| `get_parameters(name_filter="")` | Parameters (mm / deg / ul), expression, `user`/`model` kind and owner (feature or sketch). |
+| `get_feature_tree()` | Feature tree: order, name, type, suppressed or not. |
+| `capture_view(width, height, fit)` | PNG screenshot of the active view. |
+| `set_parameter(name, value, unit="mm")` | Changes a parameter and updates the model; returns mass and bbox before/after. |
+| `undo_last()` | Undoes the last operation in Inventor. |
 
-### Önerilen çalışma döngüsü
+### Recommended workflow
 
 ```mermaid
 flowchart TD
-    A([Kullanıcı isteği]) --> B[api_guide<br/>ilk kullanımda]
-    B --> C[api_search / api_get<br/>doğru nesne ve imzayı bul]
-    C --> D[get_feature_tree / get_parameters<br/>modeli anla]
-    D --> E[execute veya set_parameter<br/>küçük bir adım]
+    A([User request]) --> B[api_guide<br/>on first use]
+    B --> C[api_search / api_get<br/>find the right object and signature]
+    C --> D[get_feature_tree / get_parameters<br/>understand the model]
+    D --> E[execute or set_parameter<br/>one small step]
     E --> F{ok?}
-    F -- hayır --> G[Otomatik rollback<br/>hatayı oku] --> C
-    F -- evet --> H[get_active_document / capture_view<br/>sonucu doğrula]
-    H --> I{Beklenen gibi mi?}
-    I -- hayır --> J[undo_last] --> C
-    I -- evet --> K{Başka adım var mı?}
-    K -- evet --> E
-    K -- hayır --> L([Kaydetmeden önce kullanıcıya sor])
+    F -- no --> G[Automatic rollback<br/>read the error] --> C
+    F -- yes --> H[get_active_document / capture_view<br/>verify the result]
+    H --> I{As expected?}
+    I -- no --> J[undo_last] --> C
+    I -- yes --> K{More steps?}
+    K -- yes --> E
+    K -- no --> L([Ask the user before saving])
 ```
 
 ---
 
-## execute ortamı
+## The execute environment
 
-`execute` içindeki kodda şu isimler hazırdır:
+These names are available inside `execute` code:
 
-| İsim | İçerik |
+| Name | Contents |
 |---|---|
 | `app` | `Inventor.Application` |
-| `doc` | `app.ActiveDocument` (yoksa `None`) |
-| `cd` | `doc.ComponentDefinition` (parça/montajda) |
+| `doc` | `app.ActiveDocument` (`None` if no document is open) |
+| `cd` | `doc.ComponentDefinition` (parts/assemblies) |
 | `tg` | `app.TransientGeometry` |
 | `to` | `app.TransientObjects` |
-| `C` | Enum sabitleri: `C.kJoinOperation`, `C.kPartDocumentObject` ... (bilinmeyen adda yakın öneriler verir) |
-| `mm(x)`, `deg(x)` | mm → cm, derece → radyan (API'ye vermek için) |
-| `to_mm(x)`, `to_deg(x)` | cm → mm, radyan → derece |
-| `com_type(obj)` | COM nesnesinin tip adı (`'ExtrudeFeature'`) |
-| `print(...)` | Çıktıyı yakalar |
-| `result` | Bu değişkene atanan değer sonuç olarak döner (COM nesneleri `<Tip 'Ad'>` olarak gösterilir) |
+| `C` | Enum constants: `C.kJoinOperation`, `C.kPartDocumentObject` ... (suggests close matches for unknown names) |
+| `mm(x)`, `deg(x)` | mm → cm, degrees → radians (for passing to the API) |
+| `to_mm(x)`, `to_deg(x)` | cm → mm, radians → degrees |
+| `com_type(obj)` | Type name of a COM object (`'ExtrudeFeature'`) |
+| `print(...)` | Captures output |
+| `result` | Whatever you assign here is returned (COM objects are shown as `<Type 'Name'>`) |
 
-Örnek:
+Example:
 
 ```python
-sk = cd.Sketches.Add(cd.WorkPlanes.Item(3))                     # XY düzlemi
+sk = cd.Sketches.Add(cd.WorkPlanes.Item(3))                     # XY plane
 sk.SketchCircles.AddByCenterRadius(tg.CreatePoint2d(0, 0), mm(10))
 prof = sk.Profiles.AddForSolid()
 ed = cd.Features.ExtrudeFeatures.CreateExtrudeDefinition(prof, C.kJoinOperation)
@@ -247,11 +245,11 @@ ed.SetDistanceExtent(mm(20), C.kPositiveExtentDirection)
 result = cd.Features.ExtrudeFeatures.Add(ed)
 ```
 
-## Birimler
+## Units
 
-Inventor API'nin iç birimi her zaman **cm** ve **radyan**dır (kütle kg). Sunucu kullanıcıya dönük değerleri dönüştürür:
+The Inventor API's internal units are always **cm** and **radians** (mass in kg). The server converts user-facing values:
 
-| Birim | Faktör (iç → gösterim) |
+| Unit | Factor (internal → display) |
 |---|---|
 | `mm` | × 10 |
 | `cm` | × 1 |
@@ -260,46 +258,46 @@ Inventor API'nin iç birimi her zaman **cm** ve **radyan**dır (kütle kg). Sunu
 | `deg` | × 180/π |
 | `rad`, `ul` | × 1 |
 
-> Türkçe yerel ayarda metin ifadeleri (`"20,5 mm"`) ondalık **virgül** bekler. Bu yüzden sayısal (cm/rad) değer vermek daha güvenlidir.
+> String expressions follow the OS locale. On a Turkish locale, Inventor expects a decimal **comma** (`"20,5 mm"`), so passing numeric (cm/rad) values is safer.
 
 ---
 
-## Güvenlik ve geri alma
+## Safety and undo
 
 ```mermaid
 stateDiagram-v2
-    [*] --> TransactionAçık: StartTransaction("LLM: açıklama")
-    TransactionAçık --> KodÇalışıyor: exec(code)
-    KodÇalışıyor --> Commit: başarılı → tr.End()
-    KodÇalışıyor --> Rollback: istisna → tr.Abort() + doc.Update()
-    Commit --> UndoListesi: Inventor Undo listesinde "LLM: ..." olarak görünür
-    UndoListesi --> GeriAlındı: undo_last()
-    Rollback --> [*]: ok=false, rolled_back=true
-    GeriAlındı --> [*]
-    UndoListesi --> [*]
+    [*] --> TransactionOpen: StartTransaction("LLM: description")
+    TransactionOpen --> Running: exec(code)
+    Running --> Committed: success → tr.End()
+    Running --> RolledBack: exception → tr.Abort() + doc.Update()
+    Committed --> UndoList: shows up in Inventor's Undo list as "LLM: ..."
+    UndoList --> Undone: undo_last()
+    RolledBack --> [*]: ok=false, rolled_back=true
+    Undone --> [*]
+    UndoList --> [*]
 ```
 
-- `execute` ve `set_parameter` her çağrıyı **tek transaction** içinde çalıştırır; hata olursa tüm değişiklikler geri alınır.
-- Başarılı adımlar Inventor Undo listesinde `LLM: <description>` adıyla görünür, `undo_last` veya Inventor'dan elle geri alınabilir.
-- Salt okuma yapan kodlarda `transaction=False` verilebilir.
-- Değişiklik yapan tüm çağrılar `logs/calls.jsonl` dosyasına (zaman, tool, argümanlar, sonuç/hata) yazılır.
-- ⚠️ `execute` **keyfi Python kodu** çalıştırır ve sandbox yoktur. Sunucuyu yalnızca güvendiğiniz istemcilere bağlayın; önemli dosyalarda değişiklikten önce `SaveAs` ile kopya alın.
+- `execute` and `set_parameter` run each call in **a single transaction**; on error, every change is rolled back.
+- Successful steps show up in Inventor's Undo list as `LLM: <description>` and can be undone with `undo_last` or manually in Inventor.
+- Read-only code can pass `transaction=False`.
+- Every `execute`, `set_parameter` and `undo_last` call is written to `logs/calls.jsonl` (timestamp, tool, arguments, result/error).
+- ⚠️ `execute` runs **arbitrary Python code** with no sandbox. Only connect the server to clients you trust, and make a copy with `SaveAs` before changing important files.
 
 ---
 
-## Dosya yapısı
+## Project layout
 
 ```
 InventorLLM/
-├── server.py          # MCP sunucusu (tek dosya)
-├── inventor_api.db    # Inventor API dokümantasyonu (SQLite + FTS5)
-├── logs/              # Çalışma zamanı logları (git'e eklenmez)
+├── server.py          # MCP server (single file)
+├── inventor_api.db    # Inventor API documentation (SQLite + FTS5)
+├── logs/              # Runtime logs (git-ignored)
 │   └── calls.jsonl
-├── .vscode/           # Editör ayarları (conda ortamı)
+├── .vscode/           # Editor settings (conda environment)
 └── README.md
 ```
 
-### inventor_api.db şeması
+### inventor_api.db schema
 
 ```mermaid
 erDiagram
@@ -311,7 +309,7 @@ erDiagram
         text body
     }
     pages_fts {
-        text name "FTS5 sanal tablo, bm25 ağırlıklı"
+        text name "FTS5 virtual table, bm25-weighted"
         text summary
         text body
     }
@@ -329,20 +327,22 @@ erDiagram
         text name "kJoinOperation ..."
         int value
     }
-    pages ||--|| pages_fts : "FTS5 indeksi (rowid)"
-    pages ||--o{ members : "object.member imzası"
+    pages ||--|| pages_fts : "FTS5 index (rowid)"
+    pages ||--o{ members : "object.member signature"
 ```
 
 ---
 
-## Sorun giderme
+## Troubleshooting
 
-| Belirti | Olası neden / çözüm |
+| Symptom | Likely cause / fix |
 |---|---|
-| `pywintypes.com_error: Operation unavailable` | Inventor açık değil. Önce Inventor'ı başlatın. |
-| `TimeoutError: Inventor yanıt vermedi` | Inventor'da açık bir diyalog kutusu var; kapatıp tekrar deneyin. |
-| `inventor_api.db bulunamadı` | Dosyayı `server.py` yanına koyun veya `INVENTOR_API_DB` ortam değişkenini ayarlayın. |
-| `Aktif doküman ... bir parça/montaj değil` | Çizim (`.idw`/`.dwg`) aktif; bir parça veya montaj açın. |
-| `Bilinmeyen sabit: kXxx` | Hata mesajındaki yakın adlara bakın veya `api_enum` ile arayın. |
-| Metin ifadesinde parse hatası | Türkçe yerel ayar: ondalık için virgül kullanın ya da sayısal değer verin. |
-| MCP bağlantısı bozuk / JSON hatası | Sunucu koduna `print()` eklenmiş olabilir; stdout yalnızca MCP içindir. |
+| `pywintypes.com_error: Operation unavailable` | Inventor isn't running. Start Inventor first. |
+| `TimeoutError: Inventor yanıt vermedi` | A dialog box is open in Inventor; close it and try again. |
+| `inventor_api.db bulunamadı` | Put the file next to `server.py` or set the `INVENTOR_API_DB` environment variable. |
+| `Aktif doküman ... bir parça/montaj değil` | A drawing (`.idw`/`.dwg`) is active; open a part or assembly. |
+| `Bilinmeyen sabit: kXxx` | Check the close matches listed in the error, or search with `api_enum`. |
+| Parse error in a string expression | Turkish locale: use a comma as the decimal separator, or pass a numeric value. |
+| Broken MCP connection / JSON errors | A `print()` may have been added to the server code; stdout is reserved for MCP. |
+
+> The server's own messages and tool descriptions are in Turkish; the error strings above are quoted as they appear.
