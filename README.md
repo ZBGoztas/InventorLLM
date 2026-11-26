@@ -96,7 +96,7 @@ sequenceDiagram
 - Windows 10/11
 - Autodesk Inventor 2027 (must be **running** while the server is in use)
 - Python 3.10+ (developed in a conda environment)
-- Packages: `pywin32`, `mcp`
+- Packages: `pywin32`, `mcp`, and `markdownify` for building the documentation database
 
 ## Installation
 
@@ -106,10 +106,19 @@ cd InventorLLM
 
 conda create -n inventor python=3.11 -y
 conda activate inventor
-pip install pywin32 "mcp[cli]"
+pip install pywin32 "mcp[cli]" markdownify
+
+python build_api_db.py   # builds inventor_api.db from your own Inventor installation
 ```
 
-`inventor_api.db` (~55 MB) ships with the repo. The server looks for the database in this order:
+`inventor_api.db` is **not** in the repository: Autodesk's API documentation isn't redistributed. `build_api_db.py` generates it from your own installation:
+
+- `RxInventor.tlb` (the type library in `<Inventor>\Bin`) gives exact signatures, default values and enum constants.
+- `admapi_*.chm` (the API help, found under `C:\Users\Public\Documents\Autodesk\Inventor 20xx`) gives object and member pages, code samples and overview pages.
+
+Both are found automatically. To point at them yourself, use `--tlb` / `--chm`. `--no-chm` builds from the type library only. Inventor doesn't need to be running. The result is about 55 MB.
+
+The server looks for the database in this order:
 
 1. The `INVENTOR_API_DB` environment variable
 2. The same folder as `server.py`
@@ -290,7 +299,8 @@ stateDiagram-v2
 ```
 InventorLLM/
 ├── server.py          # MCP server (single file)
-├── inventor_api.db    # Inventor API documentation (SQLite + FTS5)
+├── build_api_db.py    # Builds inventor_api.db from the local Inventor installation
+├── inventor_api.db    # Generated API documentation (SQLite + FTS5, git-ignored)
 ├── logs/              # Runtime logs (git-ignored)
 │   └── calls.jsonl
 ├── .vscode/           # Editor settings (conda environment)
@@ -339,7 +349,7 @@ erDiagram
 |---|---|
 | `pywintypes.com_error: Operation unavailable` | Inventor isn't running. Start Inventor first. |
 | `TimeoutError: Inventor yanıt vermedi` | A dialog box is open in Inventor; close it and try again. |
-| `inventor_api.db bulunamadı` | Put the file next to `server.py` or set the `INVENTOR_API_DB` environment variable. |
+| `inventor_api.db bulunamadı` | Run `python build_api_db.py`, or put an existing file next to `server.py` / set `INVENTOR_API_DB`. |
 | `Aktif doküman ... bir parça/montaj değil` | A drawing (`.idw`/`.dwg`) is active; open a part or assembly. |
 | `Bilinmeyen sabit: kXxx` | Check the close matches listed in the error, or search with `api_enum`. |
 | Parse error in a string expression | Turkish locale: use a comma as the decimal separator, or pass a numeric value. |

@@ -43,7 +43,8 @@ def _find_db() -> Path:
     for c in candidates:
         if c and Path(c).exists():
             return Path(c)
-    raise FileNotFoundError("inventor_api.db bulunamadı (server.py yanına koy veya INVENTOR_API_DB ayarla).")
+    raise FileNotFoundError("inventor_api.db bulunamadı: önce `python build_api_db.py` ile üret "
+        "(veya dosyayı server.py yanına koy / INVENTOR_API_DB ayarla).")
 
 
 DB_PATH = _find_db()

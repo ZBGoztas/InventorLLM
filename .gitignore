@@ -7,6 +7,9 @@ venv/
 # Çalışma zamanı logları
 logs/
 
+# Kullanıcının kendi Inventor kurulumundan üretilir (build_api_db.py); Autodesk dokümantasyonu dağıtılmaz
+inventor_api.db
+
 # Editör / OS
 .DS_Store
 Thumbs.db
